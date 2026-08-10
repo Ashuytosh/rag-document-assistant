@@ -4,6 +4,7 @@ Claude Code passes the tool call as JSON on stdin. We inspect the target
 file path and exit with code 2 to block the call if it is a .env file.
 Exit 0 lets the call proceed.
 """
+
 import json
 import sys
 

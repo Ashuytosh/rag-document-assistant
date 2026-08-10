@@ -4,6 +4,7 @@ Runs `ruff format` and `ruff check --fix` on the changed file so code stays
 clean without manual formatting. Fails silently if ruff isn't installed, so
 it never blocks the workflow.
 """
+
 import json
 import pathlib
 import subprocess
