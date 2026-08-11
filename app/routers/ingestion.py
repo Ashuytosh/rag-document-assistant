@@ -156,7 +156,12 @@ async def ingest(
     try:
         # Splitting is synchronous and CPU-bound — keep it off the event loop.
         chunks = await run_in_threadpool(
-            chunk_document, extracted.text, document_id, doc_metadata, settings
+            chunk_document,
+            extracted.text,
+            document_id,
+            doc_metadata,
+            settings,
+            extracted.page_offsets,
         )
         await run_in_threadpool(storage.save_chunks, document_id, chunks, settings)
     except BaseException as exc:

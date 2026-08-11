@@ -50,6 +50,22 @@ class DocumentNotFoundError(IngestionError):
     status_code = status.HTTP_404_NOT_FOUND
 
 
+class UnsupportedModelError(IngestionError):
+    """The requested generation model is not in the configured allowlist."""
+
+    status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+
+
+class GenerationError(IngestionError):
+    """The language model could not be reached or failed to produce an answer.
+
+    A 503 for the same reason as :class:`VectorStoreError`: it is a dependency being
+    unavailable, not a problem with the caller's request.
+    """
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+
 class VectorStoreError(IngestionError):
     """The vector store could not be reached, read, or written.
 

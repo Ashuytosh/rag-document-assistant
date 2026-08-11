@@ -4,12 +4,15 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import AnyHttpUrl, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 #: Upper bound on how many results a single search may request, so one call cannot ask
 #: the store for an unbounded number of vectors.
 MAX_TOP_K = 50
+#: Tighter bound for generation: every retrieved chunk is prompt text, and too many
+#: pushes the system prompt — including the grounding rules — out of the context window.
+MAX_GENERATION_TOP_K = 12
 
 PDF_CONTENT_TYPE = "application/pdf"
 DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -80,6 +83,46 @@ class Settings(BaseSettings):
     chroma_distance: Literal["cosine"] = "cosine"
 
     search_top_k: int = Field(default=5, gt=0, le=MAX_TOP_K)
+
+    #: Generation runs on Ollama locally. Temperature is deliberately low: the answer
+    #: must be faithful to the retrieved context, not creative.
+    ollama_base_url: AnyHttpUrl = AnyHttpUrl("http://localhost:11434")
+    generation_model: str = "qwen2.5:7b"
+    #: Closed set, not a pattern: `model` is client-supplied, and any installed name
+    #: would otherwise let a caller force repeated multi-GB evict/reload cycles on the
+    #: 8 GB VRAM budget, and enumerate what is installed from the response codes.
+    allowed_generation_models: set[str] = {
+        "qwen2.5:7b",
+        "qwen2.5-coder:7b",
+        "phi4-mini",
+        "gemma3:4b",
+        "mistral:7b",
+    }
+    generation_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
+    #: Chunks retrieved to build the answer's context. Bounded well below MAX_TOP_K:
+    #: the context is prompt text, and Ollama truncates from the front once num_ctx is
+    #: exceeded — so an unbounded top_k lets a caller push the grounding rules out of
+    #: the window entirely.
+    generation_top_k: int = Field(default=5, gt=0, le=MAX_GENERATION_TOP_K)
+    generation_num_ctx: int = Field(default=8192, gt=0)
+    #: Hard cap on generated tokens. Without it, output length is bounded only by the
+    #: context window and one request can occupy the GPU for minutes.
+    generation_num_predict: int = Field(default=1024, gt=0)
+    #: Concurrent generations. One GPU with one resident model: queueing beyond this
+    #: adds latency and memory pressure without adding throughput.
+    generation_concurrency: int = Field(default=2, gt=0)
+    #: Total wall-clock budget for one generation.
+    request_timeout_s: float = Field(default=120.0, gt=0)
+
+    @model_validator(mode="after")
+    def _check_generation_model_allowed(self) -> "Settings":
+        """The configured default must itself be in the allowlist."""
+        if self.generation_model not in self.allowed_generation_models:
+            raise ValueError(
+                f"generation_model ({self.generation_model}) must be one of "
+                f"{sorted(self.allowed_generation_models)}."
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_chunk_bounds(self) -> "Settings":
