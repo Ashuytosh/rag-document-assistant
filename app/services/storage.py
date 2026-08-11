@@ -1,13 +1,21 @@
 """Persistence of uploaded documents and their extracted text."""
 
+import json
 import uuid
 from pathlib import Path
 
 from fastapi import UploadFile
+from pydantic import ValidationError
 
 from app.config import CONTENT_TYPE_EXTENSIONS, Settings
-from app.core.exceptions import FileTooLargeError, UnsupportedFileTypeError
+from app.core.exceptions import (
+    NOT_FOUND_DETAIL,
+    DocumentNotFoundError,
+    FileTooLargeError,
+    UnsupportedFileTypeError,
+)
 from app.core.logging import get_logger
+from app.models.chunk import Chunk
 
 #: Read the upload in 1 MB slices so a large file never lands in memory whole.
 CHUNK_BYTES = 1024 * 1024
@@ -66,3 +74,60 @@ def save_text(document_id: str, text: str, settings: Settings) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(text, encoding="utf-8")
     return destination
+
+
+def chunks_path(document_id: str, settings: Settings) -> Path:
+    """Path of the persisted chunk file for ``document_id``.
+
+    Callers must have already validated ``document_id`` — it is client-supplied on the
+    read path, and it is interpolated into a filename here.
+    """
+    return settings.upload_dir / f"{document_id}.chunks.json"
+
+
+def save_chunks(document_id: str, chunks: list[Chunk], settings: Settings) -> Path:
+    """Write ``chunks`` to ``{upload_dir}/{document_id}.chunks.json`` and return its path.
+
+    Interim persistence: Phase 3 moves chunks into the vector store.
+    """
+    destination = chunks_path(document_id, settings)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    payload = [chunk.model_dump() for chunk in chunks]
+    # Write-then-replace, so a crash mid-write cannot leave a truncated file that a
+    # later read would have to treat as a missing document.
+    staging = destination.with_suffix(".tmp")
+    staging.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    staging.replace(destination)
+    return destination
+
+
+def load_chunks(
+    document_id: str, settings: Settings, limit: int | None = None
+) -> tuple[int, list[Chunk]]:
+    """Read the persisted chunks for ``document_id``.
+
+    Returns the total number stored and at most ``limit`` validated chunks. Only the
+    returned window is turned into models: a caller asking for 1 chunk of 15,000 should
+    not pay to validate all 15,000.
+
+    Raises:
+        DocumentNotFoundError: no chunk file exists, or the one on disk is unusable.
+    """
+    source = chunks_path(document_id, settings)
+    try:
+        if source.stat().st_size > settings.max_chunks_file_bytes:
+            log.warning("storage.chunks_oversize", document_id=document_id)
+            raise DocumentNotFoundError(NOT_FOUND_DETAIL)
+        raw = json.loads(source.read_text(encoding="utf-8"))
+        if not isinstance(raw, list):
+            raise TypeError(f"expected a JSON list, got {type(raw).__name__}")
+        window = raw if limit is None else raw[:limit]
+        return len(raw), [Chunk.model_validate(item) for item in window]
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise DocumentNotFoundError(NOT_FOUND_DETAIL) from exc
+    except (ValueError, ValidationError, TypeError) as exc:
+        # Corrupt, truncated, or non-UTF-8: not a fault the caller can act on, and
+        # surfacing it as a 500 would leak parser detail. Treat it as absent, but log it.
+        # ValueError covers both JSONDecodeError and UnicodeDecodeError.
+        log.warning("storage.chunks_unreadable", document_id=document_id, error=type(exc).__name__)
+        raise DocumentNotFoundError(NOT_FOUND_DETAIL) from exc

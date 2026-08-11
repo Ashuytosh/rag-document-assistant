@@ -35,6 +35,21 @@ class ExtractionError(IngestionError):
     status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
 
 
+#: Fixed text for every not-found path, so a client-supplied id is never reflected back
+#: into a response body. The id belongs in the structured log, not the payload.
+NOT_FOUND_DETAIL = "No chunks found for the requested document."
+
+
+class DocumentNotFoundError(IngestionError):
+    """No stored document matches the requested id.
+
+    Also raised for a malformed id: the client cannot distinguish the two, which keeps
+    the endpoint from confirming what a valid id looks like.
+    """
+
+    status_code = status.HTTP_404_NOT_FOUND
+
+
 async def ingestion_error_handler(_request: Request, exc: Exception) -> JSONResponse:
     """Render an :class:`IngestionError` as ``{"error": ..., "detail": ...}``.
 
