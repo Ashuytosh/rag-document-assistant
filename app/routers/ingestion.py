@@ -16,11 +16,14 @@ from app.core.exceptions import (
     UnsupportedFileTypeError,
 )
 from app.core.logging import get_logger
-from app.models.chunk import ChunksResponse
+from app.dependencies import get_embedding_service, get_vector_store
+from app.models.chunk import Chunk, ChunksResponse
 from app.models.document import FILENAME_MAX_LENGTH, PREVIEW_CHARS, DocumentMetadata, IngestResponse
 from app.services import storage
 from app.services.chunking import chunk_document
+from app.services.embedding import EmbeddingService
 from app.services.extraction import extract_text
+from app.services.vector_store import VectorStoreService
 
 router = APIRouter(tags=["ingestion"])
 log = get_logger(__name__)
@@ -56,6 +59,27 @@ def _discard(*paths: Path) -> None:
             log.warning("ingest.cleanup_failed", path=path.name)
 
 
+def _discard_vectors(vector_store: VectorStoreService, document_id: str) -> None:
+    """Drop a document's vectors, without masking the error that prompted the rollback."""
+    try:
+        vector_store.delete_document(document_id)
+    except Exception:
+        log.warning("ingest.vector_cleanup_failed", document_id=document_id)
+
+
+def _embed_and_store(
+    chunks: list[Chunk], embeddings: EmbeddingService, vector_store: VectorStoreService
+) -> int:
+    """Check chunk sizes against the model's window, then embed and store them.
+
+    Synchronous and CPU-bound: the caller runs this in a thread pool.
+    """
+    oversized = sum(1 for chunk in chunks if not embeddings.assert_within_limit(chunk.text))
+    if oversized:
+        log.warning("ingest.chunks_over_token_limit", count=oversized, total=len(chunks))
+    return vector_store.add_chunks(chunks)
+
+
 def _validated_document_id(document_id: str) -> str:
     """Confirm ``document_id`` is a uuid before it is interpolated into a path.
 
@@ -79,6 +103,8 @@ def _validated_document_id(document_id: str) -> str:
 @router.post("/ingest", response_model=IngestResponse)
 async def ingest(
     settings: Annotated[Settings, Depends(get_settings)],
+    embeddings: Annotated[EmbeddingService, Depends(get_embedding_service)],
+    vector_store: Annotated[VectorStoreService, Depends(get_vector_store)],
     file: Annotated[UploadFile, File(description="A PDF or DOCX document.")],
 ) -> IngestResponse:
     """Accept a document upload, extract its text, persist both, and return metadata.
@@ -139,6 +165,16 @@ async def ingest(
         log.warning("ingest.failed", stage="chunk", error=type(exc).__name__)
         raise
 
+    try:
+        vectors_added = await run_in_threadpool(_embed_and_store, chunks, embeddings, vector_store)
+    except BaseException as exc:
+        # A partial vector add would still be counted by /stats and returned by /search,
+        # so drop the document's vectors along with its files.
+        _discard(saved_path, text_path, storage.chunks_path(document_id, settings))
+        _discard_vectors(vector_store, document_id)
+        log.warning("ingest.failed", stage="embed", error=type(exc).__name__)
+        raise
+
     metadata = DocumentMetadata(
         id=document_id,
         filename=filename,
@@ -154,6 +190,7 @@ async def ingest(
         char_count=extracted.char_count,
         page_count=extracted.page_count,
         chunk_count=len(chunks),
+        vectors_added=vectors_added,
     )
     return IngestResponse(status="ok", document=metadata, chunk_count=len(chunks))
 

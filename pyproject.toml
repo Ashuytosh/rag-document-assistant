@@ -13,4 +13,9 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# Integration tests load the real embedding model (~90 MB download on first run), so
+# they are deselected by default. Run them with: pytest -m integration
+addopts = "-q -m 'not integration'"
+markers = [
+    "integration: exercises the real embedding model; slow, needs the model cached",
+]

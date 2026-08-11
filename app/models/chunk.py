@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 #: Document-level metadata propagated onto every chunk. Values stay JSON-scalar because
 #: Phase 3 hands them to ChromaDB, whose metadata values must be str/int/float/bool —
 #: `page_count` being None will need handling there.
-type ChunkMetadata = dict[str, str | int | None]
+type ChunkMetadata = dict[str, str | int | float | bool | None]
 
 
 class Chunk(BaseModel):

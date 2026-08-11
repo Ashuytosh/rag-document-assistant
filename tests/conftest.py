@@ -4,17 +4,22 @@ Fixture documents are generated rather than committed as binaries, so the suite 
 dependency-light and deterministic. Extraction runs locally, so nothing is mocked.
 """
 
+import hashlib
 import io
+import struct
 from collections.abc import Iterator
 from pathlib import Path
 
 import docx
 import pytest
 from fastapi.testclient import TestClient
+from langchain_core.embeddings import Embeddings
 
 from app import main
 from app.config import Settings, get_settings
 from app.main import app
+from app.services.embedding import EmbeddingService
+from app.services.vector_store import VectorStoreService
 
 PDF_SAMPLE_TEXT = "Retrieval augmented generation test document."
 DOCX_PARAGRAPHS = ("Grounded answers require citations.", "Every passage carries a source.")
@@ -103,6 +108,62 @@ def long_docx_bytes() -> bytes:
     return _build_docx(("word " * 400,))
 
 
+class FakeEmbeddings(Embeddings):
+    """Deterministic, dependency-free stand-in for the sentence-transformers model.
+
+    Vectors are derived from a hash of the text and unit-normalized, so cosine distance
+    behaves the way it does with the real model: identical text scores 1.0, unrelated
+    text scores lower. Word overlap is blended in so that a query sharing words with a
+    chunk lands nearer to it than to an unrelated chunk — enough to make ranking
+    assertions meaningful without loading torch.
+    """
+
+    dimensions = 16
+
+    def _vector(self, text: str) -> list[float]:
+        vector = [0.0] * self.dimensions
+        for word in text.lower().split() or [text.lower()]:
+            digest = hashlib.sha256(word.encode("utf-8")).digest()
+            for index in range(self.dimensions):
+                (component,) = struct.unpack_from("<h", digest, index * 2)
+                vector[index] += component / 32768.0
+        magnitude = sum(value * value for value in vector) ** 0.5
+        if magnitude == 0:
+            return [1.0] + [0.0] * (self.dimensions - 1)
+        return [value / magnitude for value in vector]
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        return [self._vector(text) for text in texts]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._vector(text)
+
+
+@pytest.fixture
+def fake_embeddings() -> FakeEmbeddings:
+    return FakeEmbeddings()
+
+
+@pytest.fixture
+def chroma_dir(tmp_path: Path) -> Path:
+    """An isolated Chroma directory, so tests never touch the real chroma_db/."""
+    return tmp_path / "chroma"
+
+
+@pytest.fixture
+def embedding_service(test_settings: Settings, fake_embeddings: FakeEmbeddings) -> EmbeddingService:
+    """The real service class, wrapping a fake model — no torch, no download."""
+    return EmbeddingService(test_settings, embeddings=fake_embeddings)
+
+
+@pytest.fixture
+def vector_store(
+    test_settings: Settings, embedding_service: EmbeddingService
+) -> VectorStoreService:
+    """A real Chroma collection in a temp directory, backed by the fake embeddings."""
+    return VectorStoreService(test_settings, embedding_service.as_langchain())
+
+
 @pytest.fixture
 def upload_dir(tmp_path: Path) -> Path:
     """An isolated upload directory, so tests never touch the real data/uploads/."""
@@ -112,19 +173,30 @@ def upload_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def test_settings(upload_dir: Path) -> Settings:
-    return Settings(upload_dir=upload_dir, max_upload_bytes=TEST_MAX_UPLOAD_BYTES)
+def test_settings(upload_dir: Path, tmp_path: Path) -> Settings:
+    return Settings(
+        upload_dir=upload_dir,
+        max_upload_bytes=TEST_MAX_UPLOAD_BYTES,
+        chroma_persist_dir=tmp_path / "chroma",
+    )
 
 
 @pytest.fixture
-def client(test_settings: Settings, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
-    """A TestClient whose settings point at the per-test upload directory.
+def client(
+    test_settings: Settings,
+    embedding_service: EmbeddingService,
+    vector_store: VectorStoreService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[TestClient]:
+    """A TestClient wired to per-test storage and a fake embedding model.
 
-    The dependency override covers request handling; the ``app.main`` patch covers the
-    lifespan, which resolves settings directly and would otherwise create the real
-    ``data/uploads/`` on startup.
+    The dependency override covers request handling; the ``app.main`` patches cover the
+    lifespan, which resolves settings and builds the services directly. Without the
+    factory patches every test would load torch and download the real model.
     """
     monkeypatch.setattr(main, "get_settings", lambda: test_settings)
+    monkeypatch.setattr(main, "build_embedding_service", lambda _settings: embedding_service)
+    monkeypatch.setattr(main, "build_vector_store", lambda _settings, _embeddings: vector_store)
     app.dependency_overrides[get_settings] = lambda: test_settings
     with TestClient(app) as test_client:
         yield test_client

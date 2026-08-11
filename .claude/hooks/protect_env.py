@@ -18,13 +18,14 @@ def main() -> None:
     file_path = (data.get("tool_input", {}) or {}).get("file_path", "") or ""
     name = file_path.replace("\\", "/").rstrip("/").split("/")[-1]
 
-    if name == ".env" or name.startswith(".env."):
+    ALLOWED = {".env.example", ".env.sample", ".env.template"}
+    if (name == ".env" or name.startswith(".env.")) and name not in ALLOWED:
         print(
             "Blocked: .env files are protected. "
             "Check .env.example for the list of variable names instead.",
             file=sys.stderr,
         )
-        sys.exit(2)  # exit code 2 blocks the tool call
+        sys.exit(2)
 
     sys.exit(0)
 

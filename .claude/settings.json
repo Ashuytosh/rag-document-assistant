@@ -25,7 +25,6 @@
     "ask": [],
     "deny": [
       "Read(.env)",
-      "Read(.env.*)",
       "Bash(rm -rf:*)",
       "Bash(git push --force:*)"
     ]

@@ -2,9 +2,14 @@
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+#: Upper bound on how many results a single search may request, so one call cannot ask
+#: the store for an unbounded number of vectors.
+MAX_TOP_K = 50
 
 PDF_CONTENT_TYPE = "application/pdf"
 DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -45,6 +50,36 @@ class Settings(BaseSettings):
     #: Ceiling on a chunk file before a read refuses it, so serving chunks for a huge
     #: document cannot be used to amplify memory use on repeated requests.
     max_chunks_file_bytes: int = 32 * 1024 * 1024
+
+    #: Embeddings run on the CPU by default: the 8 GB VRAM budget is reserved for Ollama.
+    embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2"
+    #: Pin the exact model snapshot. Without it, a moved upstream `main` would be
+    #: downloaded and loaded silently on the next restart.
+    embedding_model_revision: str = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+    #: Load from the local cache only. Startup otherwise makes ~20 calls to
+    #: huggingface.co to revalidate an already-complete cache, which both slows boot and
+    #: makes the service unable to start when that host is unreachable. Set false for
+    #: the first run, which populates the cache.
+    embedding_local_files_only: bool = False
+    embedding_device: str = "cpu"
+    #: Normalized vectors make cosine distance equivalent to the dot product, which is
+    #: what lets `score = 1 - distance` be a meaningful similarity.
+    embedding_normalize: bool = True
+    embedding_max_tokens: int = Field(default=256, gt=0)
+
+    chroma_persist_dir: Path = Path("chroma_db")
+    #: Chroma requires 3-512 chars from [a-zA-Z0-9._-], starting and ending alphanumeric.
+    chroma_collection: str = Field(
+        default="documents",
+        min_length=3,
+        max_length=512,
+        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9._-]*[a-zA-Z0-9]$",
+    )
+    #: The HNSW space. `score = 1 - distance` only holds for cosine, so this is a Literal
+    #: rather than a free string — a typo would silently produce meaningless scores.
+    chroma_distance: Literal["cosine"] = "cosine"
+
+    search_top_k: int = Field(default=5, gt=0, le=MAX_TOP_K)
 
     @model_validator(mode="after")
     def _check_chunk_bounds(self) -> "Settings":

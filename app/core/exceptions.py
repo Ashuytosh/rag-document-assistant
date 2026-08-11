@@ -50,6 +50,16 @@ class DocumentNotFoundError(IngestionError):
     status_code = status.HTTP_404_NOT_FOUND
 
 
+class VectorStoreError(IngestionError):
+    """The vector store could not be reached, read, or written.
+
+    A 503 rather than a 500: the request may well succeed once the store recovers, and
+    the caller learns nothing about why it failed.
+    """
+
+    status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+
 async def ingestion_error_handler(_request: Request, exc: Exception) -> JSONResponse:
     """Render an :class:`IngestionError` as ``{"error": ..., "detail": ...}``.
 
