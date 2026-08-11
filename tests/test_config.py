@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from app.config import (
     CONTENT_TYPE_EXTENSIONS,
@@ -68,3 +69,47 @@ def test_unknown_environment_variables_are_ignored(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("SOME_UNRELATED_SETTING", "value")
 
     assert get_settings().app_name
+
+
+class TestChunkSettings:
+    def test_defaults_match_the_spec(self) -> None:
+        settings = Settings()
+
+        assert settings.chunk_size == 800
+        assert settings.chunk_overlap == 120
+        assert settings.chunk_separators == ["\n\n", "\n", ". ", " ", ""]
+
+    def test_overlap_may_not_equal_or_exceed_chunk_size(self) -> None:
+        """A window with no forward progress would loop or lose text."""
+        with pytest.raises(ValidationError, match="chunk_overlap"):
+            Settings(chunk_size=200, chunk_overlap=200)
+
+        with pytest.raises(ValidationError, match="chunk_overlap"):
+            Settings(chunk_size=200, chunk_overlap=500)
+
+    def test_overlap_up_to_half_the_chunk_size_is_accepted(self) -> None:
+        assert Settings(chunk_size=200, chunk_overlap=100).chunk_overlap == 100
+
+    def test_overlap_above_half_is_refused(self) -> None:
+        """Beyond half, the splitter cannot advance a full split and drops text."""
+        with pytest.raises(ValidationError, match="chunk_overlap"):
+            Settings(chunk_size=200, chunk_overlap=101)
+
+    def test_non_positive_chunk_size_is_refused(self) -> None:
+        """Reaches the splitter as a bare ValueError and 500s the request otherwise."""
+        for size in (0, -100):
+            with pytest.raises(ValidationError):
+                Settings(chunk_size=size)
+
+    def test_chunk_settings_are_environment_overridable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CHUNK_SIZE", "1500")
+        # The value is parsed as JSON, so the newline separator must be escaped as \\n —
+        # a raw newline here is an invalid control character inside a JSON string.
+        monkeypatch.setenv("CHUNK_SEPARATORS", '["\\n", " "]')
+
+        settings = Settings()
+
+        assert settings.chunk_size == 1500
+        assert settings.chunk_separators == ["\n", " "]

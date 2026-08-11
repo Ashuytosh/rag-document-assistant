@@ -34,3 +34,6 @@ class IngestResponse(BaseModel):
 
     status: str = "ok"
     document: DocumentMetadata
+    chunk_count: int = Field(
+        ge=0, description="Number of chunks the extracted text was split into and persisted."
+    )

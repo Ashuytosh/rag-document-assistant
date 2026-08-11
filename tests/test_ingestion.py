@@ -40,8 +40,12 @@ def test_ingest_pdf_returns_metadata(
     assert document["size_bytes"] == len(sample_pdf_bytes)
     assert PDF_SAMPLE_TEXT in document["text_preview"]
 
-    # The upload and its extracted text are both persisted, keyed by the returned id.
-    assert _stored_files(upload_dir) == [f"{document['id']}.pdf", f"{document['id']}.txt"]
+    # The upload, its extracted text, and its chunks are persisted under the returned id.
+    assert _stored_files(upload_dir) == [
+        f"{document['id']}.chunks.json",
+        f"{document['id']}.pdf",
+        f"{document['id']}.txt",
+    ]
     saved_text = (upload_dir / f"{document['id']}.txt").read_text(encoding="utf-8")
     assert saved_text.strip() == PDF_SAMPLE_TEXT
 
@@ -61,7 +65,11 @@ def test_ingest_docx_has_no_page_count(
     for paragraph in DOCX_PARAGRAPHS:
         assert paragraph in document["text_preview"]
 
-    assert _stored_files(upload_dir) == [f"{document['id']}.docx", f"{document['id']}.txt"]
+    assert _stored_files(upload_dir) == [
+        f"{document['id']}.chunks.json",
+        f"{document['id']}.docx",
+        f"{document['id']}.txt",
+    ]
 
 
 def test_ingest_response_omits_full_text(client: TestClient, sample_pdf_bytes: bytes) -> None:
@@ -183,7 +191,11 @@ def test_stored_filename_ignores_client_supplied_path(
 
     assert response.status_code == 200, response.text
     document = response.json()["document"]
-    assert _stored_files(upload_dir) == [f"{document['id']}.pdf", f"{document['id']}.txt"]
+    assert _stored_files(upload_dir) == [
+        f"{document['id']}.chunks.json",
+        f"{document['id']}.pdf",
+        f"{document['id']}.txt",
+    ]
 
 
 def test_each_ingest_gets_a_distinct_id(client: TestClient, sample_pdf_bytes: bytes) -> None:
