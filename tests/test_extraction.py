@@ -4,13 +4,14 @@ These exercise `extract_text` and its whitespace normalization directly, without
 through the HTTP layer, so failures point at the parser rather than the route.
 """
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from app.config import DOCX_CONTENT_TYPE, PDF_CONTENT_TYPE
 from app.core.exceptions import ExtractionError, UnsupportedFileTypeError
-from app.services.extraction import _normalize, extract_text
+from app.services.extraction import ExtractedDocument, _normalize, extract_text
 from tests.conftest import DOCX_PARAGRAPHS, PDF_SAMPLE_TEXT
 
 
@@ -125,3 +126,106 @@ class TestExtractText:
 
         with pytest.raises(UnsupportedFileTypeError, match="unknown"):
             extract_text(path, "")
+
+
+class TestPdfPageOffsets:
+    """`page_offsets` is what makes a citation honest.
+
+    Every entry must actually index the returned text at the start of that page's
+    content: an offset that is off by even a separator turns into a confidently wrong
+    page number on an answer the user is asked to trust.
+    """
+
+    def _extract(
+        self, tmp_path: Path, make_pdf_bytes: Callable[..., bytes], *pages: str
+    ) -> ExtractedDocument:
+        return extract_text(_write(tmp_path, "pages.pdf", make_pdf_bytes(*pages)), PDF_CONTENT_TYPE)
+
+    @pytest.mark.parametrize(
+        "pages",
+        [
+            pytest.param(("only",), id="single-page"),
+            pytest.param(("alpha", "beta", "gamma"), id="all-pages-have-text"),
+            pytest.param(("", "beta", "gamma"), id="blank-first-page"),
+            pytest.param(("alpha", "", "gamma"), id="blank-middle-page"),
+            pytest.param(("alpha", "beta", ""), id="blank-last-page"),
+            pytest.param(("", "", "gamma"), id="two-blank-leading-pages"),
+            pytest.param(("alpha", "", "", "delta"), id="two-blank-middle-pages"),
+        ],
+    )
+    def test_every_offset_indexes_the_start_of_its_page(
+        self, tmp_path: Path, make_pdf_bytes: Callable[..., bytes], pages: tuple[str, ...]
+    ) -> None:
+        result = self._extract(tmp_path, make_pdf_bytes, *pages)
+
+        assert result.page_offsets is not None
+        assert len(result.page_offsets) == len(pages) == result.page_count
+        for offset, page_text in zip(result.page_offsets, pages, strict=True):
+            if page_text:
+                assert result.text[offset:].startswith(page_text), (
+                    f"offset {offset} does not point at {page_text!r} in {result.text!r}"
+                )
+
+    @pytest.mark.parametrize(
+        "pages",
+        [
+            pytest.param(("alpha", "beta", "gamma"), id="all-pages-have-text"),
+            pytest.param(("", "beta", "gamma"), id="blank-first-page"),
+            pytest.param(("alpha", "", "gamma"), id="blank-middle-page"),
+            pytest.param(("alpha", "beta", ""), id="blank-last-page"),
+        ],
+    )
+    def test_offsets_are_monotonic_and_inside_the_text(
+        self, tmp_path: Path, make_pdf_bytes: Callable[..., bytes], pages: tuple[str, ...]
+    ) -> None:
+        """A non-monotonic or out-of-range offset would break the bisect that maps
+        a chunk back to its page."""
+        result = self._extract(tmp_path, make_pdf_bytes, *pages)
+
+        assert result.page_offsets is not None
+        assert result.page_offsets == sorted(result.page_offsets)
+        assert all(0 <= offset <= len(result.text) for offset in result.page_offsets)
+
+    def test_single_page_starts_at_zero(
+        self, tmp_path: Path, make_pdf_bytes: Callable[..., bytes]
+    ) -> None:
+        result = self._extract(tmp_path, make_pdf_bytes, "only page")
+
+        assert result.page_offsets == [0]
+        assert result.text == "only page"
+
+    def test_blank_pages_do_not_introduce_separators(
+        self, tmp_path: Path, make_pdf_bytes: Callable[..., bytes]
+    ) -> None:
+        """A blank page must not leave a gap the splitter would read as a paragraph."""
+        result = self._extract(tmp_path, make_pdf_bytes, "alpha", "", "gamma")
+
+        assert result.text == "alpha\n\ngamma"
+
+    def test_leading_blank_pages_leave_no_leading_whitespace(
+        self, tmp_path: Path, make_pdf_bytes: Callable[..., bytes]
+    ) -> None:
+        result = self._extract(tmp_path, make_pdf_bytes, "", "", "gamma")
+
+        assert result.text == "gamma"
+        assert result.char_count == len(result.text)
+
+    def test_pages_are_joined_by_a_blank_line(
+        self, tmp_path: Path, make_pdf_bytes: Callable[..., bytes]
+    ) -> None:
+        result = self._extract(tmp_path, make_pdf_bytes, "alpha", "beta")
+
+        assert result.text == "alpha\n\nbeta"
+        assert result.page_offsets == [0, len("alpha\n\n")]
+
+    def test_a_pdf_of_only_blank_pages_is_rejected(
+        self, tmp_path: Path, make_pdf_bytes: Callable[..., bytes]
+    ) -> None:
+        with pytest.raises(ExtractionError, match="No text"):
+            self._extract(tmp_path, make_pdf_bytes, "", "", "")
+
+    def test_docx_reports_no_page_offsets(self, tmp_path: Path, sample_docx_bytes: bytes) -> None:
+        """Formats without pages must say so rather than inventing a mapping."""
+        result = extract_text(_write(tmp_path, "s.docx", sample_docx_bytes), DOCX_CONTENT_TYPE)
+
+        assert result.page_offsets is None

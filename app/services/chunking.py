@@ -1,5 +1,7 @@
 """Splitting extracted document text into overlapping chunks."""
 
+from bisect import bisect_right
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.config import Settings
@@ -28,10 +30,33 @@ def _build_splitter(settings: Settings) -> RecursiveCharacterTextSplitter:
     )
 
 
+def page_for_offset(offset: int, page_offsets: list[int]) -> int:
+    """Return the 1-based page containing ``offset``.
+
+    ``page_offsets[i]`` is where page ``i + 1`` starts, so the page containing an offset
+    is the last one that starts at or before it.
+
+    Raises:
+        ValueError: ``page_offsets`` is empty — "no page data" must not silently become
+            "page 1", which would be a confidently wrong citation.
+    """
+    if not page_offsets:
+        raise ValueError("page_offsets is empty; the document has no page information")
+    return max(1, bisect_right(page_offsets, offset))
+
+
 def chunk_document(
-    text: str, document_id: str, doc_metadata: ChunkMetadata, settings: Settings
+    text: str,
+    document_id: str,
+    doc_metadata: ChunkMetadata,
+    settings: Settings,
+    page_offsets: list[int] | None = None,
 ) -> list[Chunk]:
     """Split ``text`` into overlapping chunks carrying ``doc_metadata``.
+
+    When ``page_offsets`` is supplied (PDFs), each chunk also records the page it starts
+    on, so an answer can cite the passage's real location rather than the document's
+    total page count. Formats without pages simply carry no ``page`` key.
 
     Short text yields a single chunk, which is fine. Empty text cannot reach here —
     extraction rejects it in Phase 1 — but it would simply yield an empty list.
@@ -50,6 +75,8 @@ def chunk_document(
         # beats emitting a document's worth of chunks that all claim offset 0.
         metadata = dict(split.metadata)
         start_index = metadata.pop("start_index")
+        if page_offsets:
+            metadata["page"] = page_for_offset(start_index, page_offsets)
         char_count = len(split.page_content)
         chunks.append(
             Chunk(

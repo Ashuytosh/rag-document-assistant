@@ -3,6 +3,7 @@
 from fastapi import Request
 
 from app.services.embedding import EmbeddingService
+from app.services.generation import GenerationService
 from app.services.vector_store import VectorStoreService
 
 
@@ -18,3 +19,8 @@ def get_embedding_service(request: Request) -> EmbeddingService:
 def get_vector_store(request: Request) -> VectorStoreService:
     """Return the process-wide vector store built during startup."""
     return request.app.state.vector_store
+
+
+def get_generation_service(request: Request) -> GenerationService:
+    """Return the process-wide generation service built during startup."""
+    return request.app.state.generation_service

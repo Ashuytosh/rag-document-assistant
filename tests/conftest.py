@@ -7,18 +7,22 @@ dependency-light and deterministic. Extraction runs locally, so nothing is mocke
 import hashlib
 import io
 import struct
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import docx
 import pytest
 from fastapi.testclient import TestClient
 from langchain_core.embeddings import Embeddings
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage, BaseMessage
 
 from app import main
 from app.config import Settings, get_settings
 from app.main import app
 from app.services.embedding import EmbeddingService
+from app.services.generation import GenerationService
 from app.services.vector_store import VectorStoreService
 
 PDF_SAMPLE_TEXT = "Retrieval augmented generation test document."
@@ -29,21 +33,32 @@ DOCX_PARAGRAPHS = ("Grounded answers require citations.", "Every passage carries
 TEST_MAX_UPLOAD_BYTES = 128 * 1024
 
 
-def _build_minimal_pdf(text: str) -> bytes:
-    """Assemble a single-page PDF containing ``text`` in Helvetica.
+def _build_pdf(pages: tuple[str, ...]) -> bytes:
+    """Assemble a PDF with one Helvetica text run per entry in ``pages``.
 
     Hand-built so the suite needs no PDF authoring library; pypdf extracts the text
-    back out verbatim.
+    back out verbatim. An empty string yields a structurally real page with no
+    recoverable text, which is what a scanned/image-only page looks like to the parser.
     """
-    stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode("ascii")
+    # 1 catalog, 2 page tree, 3 font, then a page object and a content stream per page.
+    page_numbers = [4 + 2 * index for index in range(len(pages))]
+    kids = b" ".join(f"{number} 0 R".encode() for number in page_numbers)
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
-        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+        b"<< /Type /Pages /Kids [" + kids + b"] /Count " + str(len(pages)).encode() + b" >>",
         b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
     ]
+    for number, text in zip(page_numbers, pages, strict=True):
+        stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET".encode("ascii")
+        objects.append(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 3 0 R >> >> /Contents "
+            + str(number + 1).encode()
+            + b" 0 R >>"
+        )
+        objects.append(
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream"
+        )
 
     buffer = io.BytesIO()
     buffer.write(b"%PDF-1.4\n")
@@ -64,6 +79,11 @@ def _build_minimal_pdf(text: str) -> bytes:
     return buffer.getvalue()
 
 
+def _build_minimal_pdf(text: str) -> bytes:
+    """Assemble a single-page PDF containing ``text``."""
+    return _build_pdf((text,))
+
+
 def _build_docx(paragraphs: tuple[str, ...]) -> bytes:
     """Assemble a DOCX containing one paragraph per entry."""
     document = docx.Document()
@@ -82,6 +102,16 @@ def sample_pdf_bytes() -> bytes:
 @pytest.fixture(scope="session")
 def sample_docx_bytes() -> bytes:
     return _build_docx(DOCX_PARAGRAPHS)
+
+
+@pytest.fixture(scope="session")
+def make_pdf_bytes() -> Callable[..., bytes]:
+    """Build a PDF with the given per-page text; ``""`` makes a page with no text."""
+
+    def _make(*pages: str) -> bytes:
+        return _build_pdf(pages)
+
+    return _make
 
 
 @pytest.fixture(scope="session")
@@ -164,6 +194,73 @@ def vector_store(
     return VectorStoreService(test_settings, embedding_service.as_langchain())
 
 
+FAKE_ANSWER = "The documents say answers must cite their sources [Source 1]."
+
+
+class RecordingFakeChatModel(GenericFakeChatModel):
+    """A chat model that returns a canned answer and remembers what it was asked.
+
+    Recording the prompts is what lets tests assert that the system prompt and the
+    fenced context actually reached the model — the grounding and injection-framing
+    rules are only worth anything if they are really in the request.
+    """
+
+    prompts: list[list[BaseMessage]] = []
+
+    def _generate(self, messages: list[BaseMessage], *args: object, **kwargs: object) -> Any:
+        self.prompts.append(list(messages))
+        return super()._generate(messages, *args, **kwargs)
+
+    def _stream(self, messages: list[BaseMessage], *args: object, **kwargs: object) -> Any:
+        self.prompts.append(list(messages))
+        return super()._stream(messages, *args, **kwargs)
+
+    @property
+    def last_prompt(self) -> list[BaseMessage]:
+        assert self.prompts, "the model was never called"
+        return self.prompts[-1]
+
+    @property
+    def last_system_prompt(self) -> str:
+        return str(self.last_prompt[0].content)
+
+    @property
+    def last_user_prompt(self) -> str:
+        return str(self.last_prompt[-1].content)
+
+
+@pytest.fixture
+def fake_chat_model() -> RecordingFakeChatModel:
+    """Streams the canned answer one token at a time, offline and instantly."""
+    return RecordingFakeChatModel(messages=iter([AIMessage(content=FAKE_ANSWER)] * 50), prompts=[])
+
+
+@pytest.fixture
+def model_factory_calls() -> list[str]:
+    """Every model name the service asked the factory to build."""
+    return []
+
+
+@pytest.fixture
+def generation_service(
+    test_settings: Settings,
+    vector_store: VectorStoreService,
+    fake_chat_model: RecordingFakeChatModel,
+    model_factory_calls: list[str],
+) -> GenerationService:
+    """The real service class over a fake LLM — no Ollama, no network.
+
+    A factory rather than an instance, so the override path production takes is the one
+    tests exercise, and the requested model name is observable.
+    """
+
+    def factory(name: str) -> RecordingFakeChatModel:
+        model_factory_calls.append(name)
+        return fake_chat_model
+
+    return GenerationService(test_settings, vector_store, chat_model_factory=factory)
+
+
 @pytest.fixture
 def upload_dir(tmp_path: Path) -> Path:
     """An isolated upload directory, so tests never touch the real data/uploads/."""
@@ -186,6 +283,7 @@ def client(
     test_settings: Settings,
     embedding_service: EmbeddingService,
     vector_store: VectorStoreService,
+    generation_service: GenerationService,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[TestClient]:
     """A TestClient wired to per-test storage and a fake embedding model.
@@ -197,6 +295,9 @@ def client(
     monkeypatch.setattr(main, "get_settings", lambda: test_settings)
     monkeypatch.setattr(main, "build_embedding_service", lambda _settings: embedding_service)
     monkeypatch.setattr(main, "build_vector_store", lambda _settings, _embeddings: vector_store)
+    monkeypatch.setattr(
+        main, "build_generation_service", lambda _settings, _store: generation_service
+    )
     app.dependency_overrides[get_settings] = lambda: test_settings
     with TestClient(app) as test_client:
         yield test_client

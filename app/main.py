@@ -8,8 +8,9 @@ from fastapi import FastAPI
 from app.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging, get_logger
-from app.routers import health, ingestion, search
+from app.routers import health, ingestion, query, search
 from app.services.embedding import EmbeddingService
+from app.services.generation import GenerationService
 from app.services.vector_store import VectorStoreService
 
 
@@ -25,6 +26,17 @@ def build_embedding_service(settings: Settings) -> EmbeddingService:
 def build_vector_store(settings: Settings, embeddings: EmbeddingService) -> VectorStoreService:
     """Construct the vector store over the embedding service's model."""
     return VectorStoreService(settings, embeddings.as_langchain())
+
+
+def build_generation_service(
+    settings: Settings, vector_store: VectorStoreService
+) -> GenerationService:
+    """Construct the generation service over the retrieval stack.
+
+    A module-level factory for the same reason as the others: tests substitute a fake
+    chat model here so nothing in the suite reaches Ollama.
+    """
+    return GenerationService(settings, vector_store)
 
 
 @asynccontextmanager
@@ -48,11 +60,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     embedding_service = build_embedding_service(settings)
     app.state.embedding_service = embedding_service
-    app.state.vector_store = build_vector_store(settings, embedding_service)
+    vector_store = build_vector_store(settings, embedding_service)
+    app.state.vector_store = vector_store
+    app.state.generation_service = build_generation_service(settings, vector_store)
     log.info(
         "app.ready",
         collection=settings.chroma_collection,
-        vectors=app.state.vector_store.count(),
+        vectors=vector_store.count(),
+        generation_model=settings.generation_model,
     )
     yield
 
@@ -65,6 +80,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
     app.include_router(ingestion.router)
     app.include_router(search.router)
+    app.include_router(query.router)
     return app
 
 
