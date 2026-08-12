@@ -104,10 +104,15 @@ class GenerationService:
     ) -> PreparedContext:
         """Retrieve context for ``query`` and format it for the prompt.
 
+        ``top_k`` counts parents: the store matches small children and returns the whole
+        parent passages they belong to, so each ``[Source N]`` the model sees is a full
+        passage rather than the fragment that happened to embed well. Citations therefore
+        describe the parent's position in the document.
+
         Synchronous and blocking (it embeds the query); callers on the event loop must
         run it in a thread pool.
         """
-        results = self._vector_store.search(query, top_k=top_k, document_id=document_id)
+        results = self._vector_store.search(query, top_k_parents=top_k, document_id=document_id)
         nonce = new_fence_nonce()
         context = format_context(results, nonce)
         sources = [_to_source(number, result) for number, result in enumerate(results, start=1)]

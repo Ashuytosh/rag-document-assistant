@@ -76,43 +76,62 @@ class TestChunkSettings:
     def test_defaults_match_the_spec(self) -> None:
         settings = Settings()
 
-        assert settings.chunk_size == 800
-        assert settings.chunk_overlap == 120
+        assert settings.parent_chunk_size == 2000
+        assert settings.parent_chunk_overlap == 200
+        assert settings.child_chunk_size == 400
+        assert settings.child_chunk_overlap == 80
         assert settings.chunk_separators == ["\n\n", "\n", ". ", " ", ""]
 
-    def test_overlap_may_not_equal_or_exceed_chunk_size(self) -> None:
+    @pytest.mark.parametrize("level", ["parent", "child"])
+    def test_overlap_may_not_equal_or_exceed_chunk_size(self, level: str) -> None:
         """A window with no forward progress would loop or lose text."""
-        with pytest.raises(ValidationError, match="chunk_overlap"):
-            Settings(chunk_size=200, chunk_overlap=200)
-
-        with pytest.raises(ValidationError, match="chunk_overlap"):
-            Settings(chunk_size=200, chunk_overlap=500)
+        for overlap in (200, 500):
+            with pytest.raises(ValidationError, match=f"{level}_chunk_overlap"):
+                Settings(**{f"{level}_chunk_size": 200, f"{level}_chunk_overlap": overlap})
 
     def test_overlap_up_to_half_the_chunk_size_is_accepted(self) -> None:
-        assert Settings(chunk_size=200, chunk_overlap=100).chunk_overlap == 100
+        settings = Settings(
+            parent_chunk_size=200,
+            parent_chunk_overlap=100,
+            child_chunk_size=50,
+            child_chunk_overlap=25,
+        )
 
-    def test_overlap_above_half_is_refused(self) -> None:
+        assert settings.parent_chunk_overlap == 100
+        assert settings.child_chunk_overlap == 25
+
+    @pytest.mark.parametrize("level", ["parent", "child"])
+    def test_overlap_above_half_is_refused(self, level: str) -> None:
         """Beyond half, the splitter cannot advance a full split and drops text."""
-        with pytest.raises(ValidationError, match="chunk_overlap"):
-            Settings(chunk_size=200, chunk_overlap=101)
+        with pytest.raises(ValidationError, match=f"{level}_chunk_overlap"):
+            Settings(**{f"{level}_chunk_size": 200, f"{level}_chunk_overlap": 101})
 
-    def test_non_positive_chunk_size_is_refused(self) -> None:
+    @pytest.mark.parametrize("level", ["parent", "child"])
+    def test_non_positive_chunk_size_is_refused(self, level: str) -> None:
         """Reaches the splitter as a bare ValueError and 500s the request otherwise."""
         for size in (0, -100):
             with pytest.raises(ValidationError):
-                Settings(chunk_size=size)
+                Settings(**{f"{level}_chunk_size": size})
+
+    def test_a_child_at_least_as_large_as_its_parent_is_refused(self) -> None:
+        """Equal sizes collapse the two levels back into Phase 2's flat chunking."""
+        for child in (2000, 3000):
+            with pytest.raises(ValidationError, match="child_chunk_size"):
+                Settings(child_chunk_size=child)
 
     def test_chunk_settings_are_environment_overridable(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("CHUNK_SIZE", "1500")
+        monkeypatch.setenv("PARENT_CHUNK_SIZE", "1500")
+        monkeypatch.setenv("CHILD_CHUNK_SIZE", "300")
         # The value is parsed as JSON, so the newline separator must be escaped as \\n —
         # a raw newline here is an invalid control character inside a JSON string.
         monkeypatch.setenv("CHUNK_SEPARATORS", '["\\n", " "]')
 
         settings = Settings()
 
-        assert settings.chunk_size == 1500
+        assert settings.parent_chunk_size == 1500
+        assert settings.child_chunk_size == 300
         assert settings.chunk_separators == ["\n", " "]
 
 

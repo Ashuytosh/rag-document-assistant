@@ -34,6 +34,9 @@ class IngestResponse(BaseModel):
 
     status: str = "ok"
     document: DocumentMetadata
-    chunk_count: int = Field(
-        ge=0, description="Number of chunks the extracted text was split into and persisted."
+    parent_count: int = Field(
+        ge=0, description="Large parent chunks persisted; the unit answers are written from."
+    )
+    child_count: int = Field(
+        ge=0, description="Small child chunks embedded into the collection; the unit matched."
     )

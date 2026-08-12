@@ -10,9 +10,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 #: Upper bound on how many results a single search may request, so one call cannot ask
 #: the store for an unbounded number of vectors.
 MAX_TOP_K = 50
-#: Tighter bound for generation: every retrieved chunk is prompt text, and too many
-#: pushes the system prompt — including the grounding rules — out of the context window.
-MAX_GENERATION_TOP_K = 12
+#: Tighter bound for generation, and the ceiling on a request's `top_k`. It counts
+#: PARENTS now, not the 800-character chunks it was originally sized for: each is ~2000
+#: characters of prompt text, so 6 already approaches half of an 8192-token window once
+#: the system prompt and question are added. Too many pushes the grounding rules out of
+#: the window entirely — which is exactly what a caller could do while this said 12.
+MAX_GENERATION_TOP_K = 6
 
 PDF_CONTENT_TYPE = "application/pdf"
 DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -44,14 +47,20 @@ class Settings(BaseSettings):
     max_uncompressed_bytes: int = 100 * 1024 * 1024
     max_compression_ratio: int = 100
 
-    #: Chunking is character-based for now; Phase 3 swaps in the embedding model's real
-    #: tokenizer. 800 chars stays inside all-MiniLM-L6-v2's ~256-token window with margin.
-    chunk_size: int = Field(default=800, gt=0)
-    chunk_overlap: int = Field(default=120, ge=0)
+    #: Parent-document retrieval splits twice. Parents are the unit an answer is written
+    #: from: large enough to hold evidence that spans several sentences, and never
+    #: embedded, so the embedding model's 256-token window does not constrain them.
+    parent_chunk_size: int = Field(default=2000, gt=0)
+    parent_chunk_overlap: int = Field(default=200, ge=0)
+    #: Children are the unit that is matched: small enough that a vector describes one
+    #: idea sharply, and comfortably inside the ~256-token window (400 chars ≈ 100 tokens).
+    child_chunk_size: int = Field(default=400, gt=0)
+    child_chunk_overlap: int = Field(default=80, ge=0)
     #: Split priority: paragraph, then line, then sentence, then word, then hard cut.
+    #: Shared by both splitters — the boundaries worth respecting do not change with size.
     chunk_separators: list[str] = ["\n\n", "\n", ". ", " ", ""]
-    #: Ceiling on a chunk file before a read refuses it, so serving chunks for a huge
-    #: document cannot be used to amplify memory use on repeated requests.
+    #: Ceiling on a parents file before a read refuses it, so serving the parents of a
+    #: huge document cannot be used to amplify memory use on repeated requests.
     max_chunks_file_bytes: int = 32 * 1024 * 1024
 
     #: Embeddings run on the CPU by default: the 8 GB VRAM budget is reserved for Ollama.
@@ -112,11 +121,15 @@ class Settings(BaseSettings):
         ],
     )
     generation_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
-    #: Chunks retrieved to build the answer's context. Bounded well below MAX_TOP_K:
-    #: the context is prompt text, and Ollama truncates from the front once num_ctx is
-    #: exceeded — so an unbounded top_k lets a caller push the grounding rules out of
+    #: Children fetched from the collection before they are collapsed to parents. Larger
+    #: than max_parents on purpose: several matches usually share a parent, so the search
+    #: must over-retrieve to have max_parents *distinct* parents to choose from.
+    retrieval_child_k: int = Field(default=15, gt=0, le=MAX_TOP_K)
+    #: Parents passed to the LLM after deduplication. Bounded well below MAX_TOP_K: each
+    #: parent is ~2000 characters of prompt text, and Ollama truncates from the front
+    #: once num_ctx is exceeded — so an unbounded count pushes the grounding rules out of
     #: the window entirely.
-    generation_top_k: int = Field(default=5, gt=0, le=MAX_GENERATION_TOP_K)
+    max_parents: int = Field(default=4, gt=0, le=MAX_GENERATION_TOP_K)
     generation_num_ctx: int = Field(default=8192, gt=0)
     #: Hard cap on generated tokens. Without it, output length is bounded only by the
     #: context window and one request can occupy the GPU for minutes.
@@ -167,13 +180,28 @@ class Settings(BaseSettings):
         The window must advance by at least half a chunk each step. Merely requiring
         ``overlap < size`` is not enough: at 99/100 the splitter makes so little forward
         progress that it emits many identical chunks and silently drops the rest of the
-        document — text that would then never be indexed.
+        document — text that would then never be indexed. Both levels are checked: the
+        parent splitter losing text loses it for retrieval entirely.
         """
-        max_overlap = self.chunk_size // 2
-        if self.chunk_overlap > max_overlap:
+        for size_name, overlap_name in (
+            ("parent_chunk_size", "parent_chunk_overlap"),
+            ("child_chunk_size", "child_chunk_overlap"),
+        ):
+            size = getattr(self, size_name)
+            overlap = getattr(self, overlap_name)
+            max_overlap = size // 2
+            if overlap > max_overlap:
+                raise ValueError(
+                    f"{overlap_name} ({overlap}) must be at most half of "
+                    f"{size_name} ({size}), i.e. <= {max_overlap}."
+                )
+        if self.child_chunk_size >= self.parent_chunk_size:
+            # Equal sizes make every parent yield exactly one identical child, which is
+            # Phase 2's flat chunking wearing a new name — no sharper matching, no wider
+            # context, and nothing in the behaviour to reveal the misconfiguration.
             raise ValueError(
-                f"chunk_overlap ({self.chunk_overlap}) must be at most half of "
-                f"chunk_size ({self.chunk_size}), i.e. <= {max_overlap}."
+                f"child_chunk_size ({self.child_chunk_size}) must be smaller than "
+                f"parent_chunk_size ({self.parent_chunk_size})."
             )
         return self
 

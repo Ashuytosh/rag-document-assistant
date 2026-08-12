@@ -237,8 +237,13 @@
       lastDocumentId = body.document.id;
       scopeToggle.disabled = false;
       scopeLabel.className = "flex cursor-pointer items-center gap-2 py-2 text-sm text-zinc-300";
-      const chunks = body.chunk_count === 1 ? "1 chunk" : body.chunk_count + " chunks";
-      setStatus(body.document.filename + " indexed — " + chunks + ".", "ok");
+      // Parents are the passages an answer is written from, children the vectors that
+      // match; showing both is what makes the small-to-big split visible from the UI.
+      const parents = body.parent_count === 1 ? "1 passage" : body.parent_count + " passages";
+      setStatus(
+        body.document.filename + " indexed — " + parents + ", " + body.child_count + " vectors.",
+        "ok",
+      );
     } catch {
       // Distinct from an HTTP error: the request never reached the server.
       setStatus("Could not reach the server. Is it still running?", "error");

@@ -19,8 +19,11 @@ from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, BaseMessage
 
 from app import main
-from app.config import Settings, get_settings
+from app.config import PDF_CONTENT_TYPE, Settings, get_settings
+from app.core.exceptions import DocumentNotFoundError
 from app.main import app
+from app.models.chunk import ChildChunk, ParentChunk
+from app.services import storage
 from app.services.embedding import EmbeddingService
 from app.services.generation import GenerationService
 from app.services.vector_store import VectorStoreService
@@ -134,8 +137,12 @@ def empty_docx_bytes() -> bytes:
 
 @pytest.fixture(scope="session")
 def long_docx_bytes() -> bytes:
-    """A DOCX whose text comfortably exceeds the preview length."""
-    return _build_docx(("word " * 400,))
+    """A DOCX whose text comfortably exceeds the preview length and one parent chunk.
+
+    Long enough to split into several parents at the default 2000-character parent size,
+    which is what makes the pagination and multi-passage tests meaningful.
+    """
+    return _build_docx(("word " * 1600,))
 
 
 class FakeEmbeddings(Embeddings):
@@ -192,6 +199,91 @@ def vector_store(
 ) -> VectorStoreService:
     """A real Chroma collection in a temp directory, backed by the fake embeddings."""
     return VectorStoreService(test_settings, embedding_service.as_langchain())
+
+
+#: Canonical document ids for tests. Real ids are uuids minted by `/ingest`, and they
+#: reach the filesystem through the parent store, so tests must use the same shape —
+#: `validated_document_id` rejects anything else.
+DOC_ONE = "11111111-1111-4111-8111-111111111111"
+DOC_TWO = "22222222-2222-4222-8222-222222222222"
+DOC_THREE = "33333333-3333-4333-8333-333333333333"
+
+
+def child_of(parent: ParentChunk, index: int = 0, text: str | None = None) -> ChildChunk:
+    """Build one child of ``parent``, defaulting to covering the parent's whole text.
+
+    ``start_index`` stays absolute in the document, the way `chunk_document` computes it.
+    """
+    body = parent.text if text is None else text
+    offset = parent.text.find(body)
+    return ChildChunk(
+        id=f"{parent.id}:c{index}",
+        parent_id=parent.id,
+        document_id=parent.document_id,
+        chunk_index=index,
+        text=body,
+        char_count=len(body),
+        token_estimate=len(body) // 4,
+        start_index=parent.start_index + max(offset, 0),
+        metadata=dict(parent.metadata),
+    )
+
+
+@pytest.fixture
+def index_parent(test_settings: Settings) -> Callable[..., ParentChunk]:
+    """Index one parent and its children the way ingestion would.
+
+    Retrieval reads parents back off disk, so a test that only wrote vectors would match
+    children and then resolve nothing. This keeps both halves in step: the parent is
+    appended to the document's parents file, and its children go into the collection.
+
+    Passing ``child_texts`` puts several children under one parent — the case the whole
+    phase exists for.
+    """
+
+    def _index(
+        store: VectorStoreService,
+        document_id: str,
+        index: int,
+        text: str,
+        *,
+        page_count: int | None = 3,
+        page: int | None = None,
+        filename: str = "report.pdf",
+        child_texts: list[str] | None = None,
+    ) -> ParentChunk:
+        metadata: dict[str, str | int | float | bool | None] = {
+            "filename": filename,
+            "content_type": PDF_CONTENT_TYPE,
+            "page_count": page_count,
+        }
+        if page is not None:
+            # Only PDFs carry a page; leaving the key absent otherwise matches what
+            # `chunk_document` produces for a format without page offsets.
+            metadata["page"] = page
+        parent = ParentChunk(
+            id=f"{document_id}:p{index}",
+            document_id=document_id,
+            chunk_index=index,
+            text=text,
+            char_count=len(text),
+            start_index=index * 100,
+            metadata=metadata,
+        )
+        try:
+            existing = storage.load_parents(document_id, test_settings)
+        except DocumentNotFoundError:
+            existing = {}
+        existing[parent.id] = parent
+        storage.save_parents(document_id, list(existing.values()), test_settings)
+
+        bodies = [None] if child_texts is None else child_texts
+        store.add_children(
+            [child_of(parent, position, body) for position, body in enumerate(bodies)]
+        )
+        return parent
+
+    return _index
 
 
 FAKE_ANSWER = "The documents say answers must cite their sources [Source 1]."

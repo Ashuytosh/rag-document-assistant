@@ -21,6 +21,13 @@ TEMPLATES_DIR = PACKAGE_DIR / "templates"
 #: Exported so the application factory can mount it without re-deriving the path.
 STATIC_DIR = PACKAGE_DIR / "static"
 
+
+def _format_megabytes(size_bytes: int) -> str:
+    """Render a byte count as megabytes, dropping a trailing ``.0``."""
+    megabytes = round(size_bytes / (1024 * 1024), 1)
+    return str(int(megabytes)) if megabytes == int(megabytes) else str(megabytes)
+
+
 router = APIRouter(tags=["ui"], include_in_schema=False)
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
@@ -38,10 +45,11 @@ async def chat_page(
             "app_version": settings.app_version,
             "available_models": settings.available_models,
             "default_model": settings.generation_model,
-            "default_top_k": settings.generation_top_k,
+            "default_top_k": settings.max_parents,
             "max_top_k": MAX_GENERATION_TOP_K,
             # Rounded, not floored: a limit under 1 MiB — which the test settings use —
-            # would otherwise advertise itself to the user as "up to 0 MB".
-            "max_upload_mb": round(settings.max_upload_bytes / (1024 * 1024), 1),
+            # would otherwise advertise itself to the user as "up to 0 MB". Whole values
+            # render without the decimal, so the common case still reads "20 MB".
+            "max_upload_mb": _format_megabytes(settings.max_upload_bytes),
         },
     )

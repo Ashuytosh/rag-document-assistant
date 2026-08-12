@@ -8,33 +8,61 @@ from pydantic import BaseModel, Field
 type ChunkMetadata = dict[str, str | int | float | bool | None]
 
 
-class Chunk(BaseModel):
-    """One span of a document's extracted text, ready to be embedded.
+class ParentChunk(BaseModel):
+    """A large span of a document — the unit an answer is written from.
 
-    ``start_index`` is the chunk's character offset in the source text. It carries no
-    weight yet, but it is the groundwork for citations: it is what will let a retrieved
-    passage be located back in the original document.
+    Parents are never embedded. They are persisted whole and loaded back after retrieval
+    has matched one of their children, so the model sees enough surrounding context to
+    answer a question whose evidence spans more than one small passage.
     """
 
-    id: str = Field(description="Deterministic identifier, `{document_id}:{chunk_index}`.")
-    document_id: str = Field(description="Id of the document this chunk came from.")
+    id: str = Field(description="Deterministic identifier, `{document_id}:p{chunk_index}`.")
+    document_id: str = Field(description="Id of the document this parent came from.")
     chunk_index: int = Field(ge=0, description="Position in the document, starting at 0.")
-    text: str = Field(description="The chunk's text.")
+    text: str = Field(description="The parent's text.")
     char_count: int = Field(ge=0, description="Length of `text` in characters.")
-    token_estimate: int = Field(
-        ge=0,
-        description="Rough token count (chars // 4); replaced by the real tokenizer in Phase 3.",
+    start_index: int = Field(
+        ge=0, description="Character offset of this parent in the source text."
     )
-    start_index: int = Field(ge=0, description="Character offset of this chunk in the source text.")
     metadata: ChunkMetadata = Field(
         default_factory=dict,
-        description="Document metadata propagated to the chunk (filename, content_type, ...).",
+        description="Document metadata propagated to the parent (filename, content_type, ...).",
+    )
+
+
+class ChildChunk(BaseModel):
+    """A small span of a parent — the unit that is embedded and matched.
+
+    ``start_index`` is absolute within the *document*, not within the parent, so a match
+    can always be located back in the original text regardless of which parent it came
+    from.
+    """
+
+    id: str = Field(description="Deterministic identifier, `{parent_id}:c{chunk_index}`.")
+    parent_id: str = Field(description="Id of the parent this child was split from.")
+    document_id: str = Field(description="Id of the document this child came from.")
+    chunk_index: int = Field(ge=0, description="Position within the parent, starting at 0.")
+    text: str = Field(description="The child's text.")
+    char_count: int = Field(ge=0, description="Length of `text` in characters.")
+    token_estimate: int = Field(
+        ge=0, description="Token count as the embedding model counts them, where available."
+    )
+    start_index: int = Field(
+        ge=0, description="Character offset of this child in the source document."
+    )
+    metadata: ChunkMetadata = Field(
+        default_factory=dict,
+        description="Document metadata propagated to the child (filename, content_type, ...).",
     )
 
 
 class ChunksResponse(BaseModel):
-    """Response body for ``GET /documents/{document_id}/chunks``."""
+    """Response body for ``GET /documents/{document_id}/chunks``.
+
+    Serves parents: they are what is persisted, and what an answer is actually built
+    from. Children exist only as vectors in the collection.
+    """
 
     document_id: str
-    total_chunks: int = Field(ge=0, description="Total stored for the document, before `limit`.")
-    chunks: list[Chunk] = Field(description="At most `limit` chunks, from the start.")
+    total_chunks: int = Field(ge=0, description="Total parents stored, before `limit`.")
+    chunks: list[ParentChunk] = Field(description="At most `limit` parents, from the start.")
