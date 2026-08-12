@@ -98,6 +98,19 @@ class Settings(BaseSettings):
         "gemma3:4b",
         "mistral:7b",
     }
+    #: Names offered in the UI model dropdown, in the order they appear. Ordering is why
+    #: this is a list and not derived from the allowlist set above; the validator below
+    #: keeps the two from drifting apart.
+    available_models: list[str] = Field(
+        min_length=1,
+        default=[
+            "qwen2.5:7b",
+            "gemma3:4b",
+            "phi4-mini",
+            "qwen2.5-coder:7b",
+            "mistral:7b",
+        ],
+    )
     generation_temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     #: Chunks retrieved to build the answer's context. Bounded well below MAX_TOP_K:
     #: the context is prompt text, and Ollama truncates from the front once num_ctx is
@@ -121,6 +134,29 @@ class Settings(BaseSettings):
             raise ValueError(
                 f"generation_model ({self.generation_model}) must be one of "
                 f"{sorted(self.allowed_generation_models)}."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_available_models_allowed(self) -> "Settings":
+        """Every model offered in the UI must be one ``/query`` will actually accept.
+
+        Without this, a name added to the dropdown but not to the allowlist would render
+        fine and then fail with a 422 only once a user selected it.
+        """
+        unknown = [
+            model for model in self.available_models if model not in self.allowed_generation_models
+        ]
+        if unknown:
+            raise ValueError(
+                f"available_models {unknown} must all be in "
+                f"{sorted(self.allowed_generation_models)}."
+            )
+        if self.generation_model not in self.available_models:
+            # The dropdown preselects generation_model; if it isn't offered, the page
+            # would silently start on a different model than the server's default.
+            raise ValueError(
+                f"available_models must include generation_model ({self.generation_model})."
             )
         return self
 

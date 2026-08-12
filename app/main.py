@@ -4,11 +4,13 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from app.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging, get_logger
-from app.routers import health, ingestion, query, search
+from app.routers import health, ingestion, query, search, ui
+from app.routers.ui import STATIC_DIR
 from app.services.embedding import EmbeddingService
 from app.services.generation import GenerationService
 from app.services.vector_store import VectorStoreService
@@ -81,6 +83,10 @@ def create_app() -> FastAPI:
     app.include_router(ingestion.router)
     app.include_router(search.router)
     app.include_router(query.router)
+    # Mounted from the package directory for the same reason the templates are: the
+    # working directory is not guaranteed to be the repository root.
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    app.include_router(ui.router)
     return app
 
 
