@@ -10,14 +10,10 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile
 from starlette.concurrency import run_in_threadpool
 
 from app.config import Settings, get_settings
-from app.core.exceptions import (
-    NOT_FOUND_DETAIL,
-    DocumentNotFoundError,
-    UnsupportedFileTypeError,
-)
+from app.core.exceptions import UnsupportedFileTypeError
 from app.core.logging import get_logger
 from app.dependencies import get_embedding_service, get_vector_store
-from app.models.chunk import Chunk, ChunksResponse
+from app.models.chunk import ChildChunk, ChunksResponse
 from app.models.document import FILENAME_MAX_LENGTH, PREVIEW_CHARS, DocumentMetadata, IngestResponse
 from app.services import storage
 from app.services.chunking import chunk_document
@@ -68,36 +64,19 @@ def _discard_vectors(vector_store: VectorStoreService, document_id: str) -> None
 
 
 def _embed_and_store(
-    chunks: list[Chunk], embeddings: EmbeddingService, vector_store: VectorStoreService
+    children: list[ChildChunk], embeddings: EmbeddingService, vector_store: VectorStoreService
 ) -> int:
-    """Check chunk sizes against the model's window, then embed and store them.
+    """Check child sizes against the model's window, then embed and store them.
+
+    Children are what gets embedded, so they are what the 256-token window applies to.
+    At ~400 characters they sit well inside it; this firing means the sizes drifted.
 
     Synchronous and CPU-bound: the caller runs this in a thread pool.
     """
-    oversized = sum(1 for chunk in chunks if not embeddings.assert_within_limit(chunk.text))
+    oversized = sum(1 for child in children if not embeddings.assert_within_limit(child.text))
     if oversized:
-        log.warning("ingest.chunks_over_token_limit", count=oversized, total=len(chunks))
-    return vector_store.add_chunks(chunks)
-
-
-def _validated_document_id(document_id: str) -> str:
-    """Confirm ``document_id`` is a uuid before it is interpolated into a path.
-
-    This is the only guard between a client-supplied id and the filesystem. A backslash
-    is not a URL path separator, so ``..\\..\\secrets`` matches the route and would
-    otherwise escape ``upload_dir`` on Windows. If a later phase adopts a different id
-    scheme (Phase 7 dedup), this is the one place to loosen.
-    """
-    try:
-        parsed = uuid.UUID(document_id)
-    except ValueError as exc:
-        raise DocumentNotFoundError(NOT_FOUND_DETAIL) from exc
-    # uuid.UUID is lenient: it accepts `urn:uuid:...`, `{braces}`, unbracketed hex,
-    # underscores, and non-ASCII digits. Require the canonical spelling so exactly one
-    # id maps to one document, and so nothing unexpected reaches the filesystem.
-    if str(parsed) != document_id:
-        raise DocumentNotFoundError(NOT_FOUND_DETAIL)
-    return str(parsed)
+        log.warning("ingest.children_over_token_limit", count=oversized, total=len(children))
+    return vector_store.add_children(children)
 
 
 @router.post("/ingest", response_model=IngestResponse)
@@ -155,7 +134,7 @@ async def ingest(
     }
     try:
         # Splitting is synchronous and CPU-bound — keep it off the event loop.
-        chunks = await run_in_threadpool(
+        parents, children = await run_in_threadpool(
             chunk_document,
             extracted.text,
             document_id,
@@ -163,20 +142,25 @@ async def ingest(
             settings,
             extracted.page_offsets,
         )
-        await run_in_threadpool(storage.save_chunks, document_id, chunks, settings)
+        await run_in_threadpool(storage.save_parents, document_id, parents, settings)
     except BaseException as exc:
-        # Leave nothing half-ingested: text with no chunks would look complete to Phase 3.
-        _discard(saved_path, text_path, storage.chunks_path(document_id, settings))
+        # Leave nothing half-ingested: text with no parents beside it would look complete
+        # to retrieval, which has no other copy of what an answer is written from.
+        _discard(saved_path, text_path, storage.parents_path(document_id, settings))
         log.warning("ingest.failed", stage="chunk", error=type(exc).__name__)
         raise
 
     try:
-        vectors_added = await run_in_threadpool(_embed_and_store, chunks, embeddings, vector_store)
+        vectors_added = await run_in_threadpool(
+            _embed_and_store, children, embeddings, vector_store
+        )
     except BaseException as exc:
         # A partial vector add would still be counted by /stats and returned by /search,
-        # so drop the document's vectors along with its files.
-        _discard(saved_path, text_path, storage.chunks_path(document_id, settings))
+        # so drop the document's vectors along with its files. Vectors first: children
+        # that outlive their parents still match, and would then eat a slot in every
+        # later query's child budget only to resolve to nothing.
         _discard_vectors(vector_store, document_id)
+        _discard(saved_path, text_path, storage.parents_path(document_id, settings))
         log.warning("ingest.failed", stage="embed", error=type(exc).__name__)
         raise
 
@@ -194,23 +178,34 @@ async def ingest(
         document_id=document_id,
         char_count=extracted.char_count,
         page_count=extracted.page_count,
-        chunk_count=len(chunks),
+        parent_count=len(parents),
+        child_count=len(children),
         vectors_added=vectors_added,
     )
-    return IngestResponse(status="ok", document=metadata, chunk_count=len(chunks))
+    return IngestResponse(
+        status="ok",
+        document=metadata,
+        parent_count=len(parents),
+        child_count=len(children),
+    )
 
 
 @router.get("/documents/{document_id}/chunks", response_model=ChunksResponse)
 async def get_chunks(
     document_id: str,
     settings: Annotated[Settings, Depends(get_settings)],
-    limit: Annotated[int, Query(ge=1, le=500, description="Maximum chunks to return.")] = 50,
+    limit: Annotated[int, Query(ge=1, le=500, description="Maximum parents to return.")] = 50,
 ) -> ChunksResponse:
-    """Return the persisted chunks for a document, capped at ``limit``.
+    """Return the persisted parent chunks for a document, capped at ``limit``.
+
+    Parents, not children: they are what is persisted, and what an answer is written
+    from. Children exist only as vectors in the collection.
 
     ``total_chunks`` always reports the full count, so a caller can tell that the list
     was truncated.
     """
-    validated_id = _validated_document_id(document_id)
-    total, chunks = await run_in_threadpool(storage.load_chunks, validated_id, settings, limit)
-    return ChunksResponse(document_id=validated_id, total_chunks=total, chunks=chunks)
+    validated_id = storage.validated_document_id(document_id)
+    total, parents = await run_in_threadpool(
+        storage.load_parents_page, validated_id, settings, limit
+    )
+    return ChunksResponse(document_id=validated_id, total_chunks=total, chunks=parents)

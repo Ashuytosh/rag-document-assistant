@@ -42,7 +42,7 @@ def test_ingest_pdf_returns_metadata(
 
     # The upload, its extracted text, and its chunks are persisted under the returned id.
     assert _stored_files(upload_dir) == [
-        f"{document['id']}.chunks.json",
+        f"{document['id']}.parents.json",
         f"{document['id']}.pdf",
         f"{document['id']}.txt",
     ]
@@ -66,8 +66,8 @@ def test_ingest_docx_has_no_page_count(
         assert paragraph in document["text_preview"]
 
     assert _stored_files(upload_dir) == [
-        f"{document['id']}.chunks.json",
         f"{document['id']}.docx",
+        f"{document['id']}.parents.json",
         f"{document['id']}.txt",
     ]
 
@@ -192,7 +192,7 @@ def test_stored_filename_ignores_client_supplied_path(
     assert response.status_code == 200, response.text
     document = response.json()["document"]
     assert _stored_files(upload_dir) == [
-        f"{document['id']}.chunks.json",
+        f"{document['id']}.parents.json",
         f"{document['id']}.pdf",
         f"{document['id']}.txt",
     ]

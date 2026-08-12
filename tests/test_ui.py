@@ -54,7 +54,7 @@ def test_the_top_k_input_is_bounded_by_the_generation_ceiling(
 
     assert field is not None
     assert f'max="{MAX_GENERATION_TOP_K}"' in field.group(0)
-    assert f'value="{test_settings.generation_top_k}"' in field.group(0)
+    assert f'value="{test_settings.max_parents}"' in field.group(0)
 
 
 def test_the_static_mount_serves_the_client_script(client: TestClient) -> None:

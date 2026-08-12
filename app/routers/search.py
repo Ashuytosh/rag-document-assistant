@@ -23,7 +23,11 @@ async def search(
     settings: Annotated[Settings, Depends(get_settings)],
     store: Annotated[VectorStoreService, Depends(get_vector_store)],
 ) -> SearchResponse:
-    """Return the chunks most similar to ``query``, best match first."""
+    """Return the parent passages most similar to ``query``, best match first.
+
+    ``top_k`` counts parents: the store matches small children and collapses them to the
+    parents they belong to, so results are whole passages and never duplicated.
+    """
     structlog.contextvars.clear_contextvars()
     structlog.contextvars.bind_contextvars(request_id=str(uuid.uuid4()))
     top_k = request.top_k or settings.search_top_k

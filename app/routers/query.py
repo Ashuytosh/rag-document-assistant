@@ -42,7 +42,9 @@ async def query(
         # surface as a 503 — blaming the dependency for the caller's bad input.
         raise UnsupportedModelError(f"Unsupported model: {request.model}")
 
-    top_k = request.top_k or settings.generation_top_k
+    # `top_k` counts parents now, not raw chunks: retrieval over-fetches children and
+    # collapses them, so this is how many whole passages the model is given.
+    top_k = request.top_k or settings.max_parents
     document_id = str(request.document_id) if request.document_id else None
     # Retrieval embeds the query: blocking CPU work, off the event loop.
     prepared = await run_in_threadpool(
